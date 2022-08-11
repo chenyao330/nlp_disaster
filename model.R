@@ -44,6 +44,7 @@ train %>%
 
 
 # Create the document-feature matrix
+quanteda_options("pattern_hashtag" = NULL) # Stop preserving the hashtag 
 combine_corpus <- corpus(combine_org, text_field = "text")
 combine_tokens <- combine_corpus %>% 
   tokens(what = "word",
@@ -64,37 +65,72 @@ train_dfm <- combine_tokens_dfm %>% dfm_subset(source=="train")
 dim(train_dfm)
 
 trainlsa <- textmodel_lsa(dfm_tfidf(train_dfm), nd = 200)
-testlsa <- predict(trainlsa, newdata = dfm_tfidf(combine_tokens_dfm %>% dfm_subset(source=="test")))
-
-
-train_df <- data.frame(target = as.factor(ifelse(train_dfm$target == 0, "No", "Yes")), trainlsa$docs)
+train_df <- data.frame(target = as.factor(ifelse(train_dfm$target == 0, "No", "Yes")), trainlsa$docs, length = train$text_length)
 names(train_df) <- make.names(names(train_df))
 
-test_df <- data.frame(as.matrix(testlsa$docs_newspace))
+testlsa <- predict(trainlsa, newdata = dfm_tfidf(combine_tokens_dfm %>% dfm_subset(source=="test")))
+test_df <- data.frame(as.matrix(testlsa$docs_newspace), length = nchar(test_org$text))
 
 set.seed(1)
-cv.folds <- createMultiFolds(train_df$target, k = 10, times = 3)
-cv.cntrl <- trainControl(method = "repeatedcv", number = 5, repeats = 3, 
+cv.folds <- createMultiFolds(train_df$target, k = 10, times = 5)
+cv.cntrl <- trainControl(method = "repeatedcv", number = 10, repeats = 5, 
                          index = cv.folds, summaryFunction = twoClassSummary, classProbs = T,
-                         allowParallel = TRUE, savePredictions = TRUE)
+                         allowParallel = TRUE, savePredictions = TRUE)#index specification takes priority over the resampling type specified by number/repeats
 
-cl <- makeCluster(3)
+
+start_time <- Sys.time()
+
+numCores <- detectCores()
+cl <- makeCluster(numCores)
 registerDoParallel(cl)
-getDoParWorkers()
 
 set.seed(1)
+
 model_list <- caretList(target ~ ., data = train_df,
                         trControl = cv.cntrl, methodList = c("glmnet", "rf", "gbm"),
                         tuneList = NULL, continue_on_fail = F)
 
+stopCluster(cl)
+
+end_time <- Sys.time()
+process_time <- end_time - start_time
+
+
+# Check if the model correlated. The less correlated the better ensembled
+#modelCor(resamples(model_list))
+
+#https://cran.r-project.org/web/packages/caretEnsemble/vignettes/caretEnsemble-intro.html 
+#Non-linear ensembles seem to work best when you have:
+#Lots of data.
+#Lots of models with similar accuracies.
+#Your models are uncorrelated: each one seems to capture a different aspect of the data, and different models perform best on different subsets of the data.
 
 set.seed(1)
 ensemble_1 <- caretStack(model_list, method = "glmnet",
                          metric = "ROC", 
-                         trControl = cv.cntrl)
-ensemble_1
+                         #DO NOT use the trainControl object you used to fit the training models to fit the ensemble. The re-sampling indexes will be wrong.
+                         #trControl = cv.cntrl,
+                         trControl = trainControl(
+                           method="boot",
+                           number=10,
+                           savePredictions="final",
+                           classProbs=TRUE,
+                           summaryFunction=twoClassSummary
+                         ))
 
-stopCluster(cl)
+# Check if ensemble model is better
+summary(ensemble_1)
+
+# Can also confirm the better model by using 'caTools'
+#library("caTools")
+#model_preds <- lapply(model_list, predict, newdata=testing, type="prob")
+#model_preds <- lapply(model_preds, function(x) x[,"M"])
+#model_preds <- data.frame(model_preds)
+#ens_preds <- predict(greedy_ensemble, newdata=testing, type="prob")
+#model_preds$ensemble <- ens_preds
+#caTools::colAUC(model_preds, testing$Class)
+
+
 
 
 pred <- predict(ensemble_1, test_df, type='raw')
@@ -103,6 +139,12 @@ submission <- read.csv("sample_submission.csv")
 str(submission)
 submission$target <- ifelse(pred == "Yes", 1, 0)
 write_csv(submission, "submission.csv")
+
+
+
+
+
+
 
 
 ## Manually select variable
